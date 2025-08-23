@@ -1,150 +1,157 @@
 package main
 
 import (
-	"errors"
-	"fmt"
-	"strings"
-	"time"
+    "context"
+    "fmt"
+    "log/slog"
+    "net/http"
+    "os/signal"
+    "syscall"
+    "time"
 
-	"github.com/google/uuid"
+    "github.com/go-chi/chi/v5"
+    "go.opentelemetry.io/contrib/bridges/otelslog"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/stdout/stdoutlog"
+    "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+    "go.opentelemetry.io/otel/log/global"
+    "go.opentelemetry.io/otel/propagation"
+    "go.opentelemetry.io/otel/sdk/log"
+    "go.opentelemetry.io/otel/sdk/trace"
 )
 
-type OrderSide int
+type contextKey string
 
 const (
-	BUY OrderSide = iota
-	SELL
+    loggerKey contextKey = "logger"
 )
-
-type OrderType int
-
-const (
-	MARKET OrderType = iota
-	LIMIT
-)
-
-type OrderStatus int
-
-const (
-	PENDING OrderStatus = iota
-	PARTIALLY_FILLED
-	FILLED
-	CANCELLED
-	REJECTED
-)
-
-type Order struct {
-	OrderID           uuid.UUID
-	Symbol            string
-	Side              OrderSide
-	Type              OrderType
-	Quantity          int64
-	RemainingQuantity int64
-	Price             int64
-	Status            OrderStatus
-	CreateAt          time.Time
-	UpdatedAt         time.Time
-}
-
-func parseStatus(s string) (OrderStatus, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "pending":
-		return PENDING, nil
-	case "partially_filled":
-		return PARTIALLY_FILLED, nil
-	case "filled":
-		return FILLED, nil
-	case "canceled":
-		return CANCELLED, nil
-	case "rejected":
-		return REJECTED, nil
-	}
-	return 0, fmt.Errorf("invalid order status: %s", s)
-}
-
-func parseSide(s string) (OrderSide, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "buy":
-		return BUY, nil
-	case "sell":
-		return SELL, nil
-	}
-	return 0, fmt.Errorf("invalid order side: %s", s)
-}
-
-func parseType(s string) (OrderType, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "market":
-		return MARKET, nil
-	case "limit":
-		return LIMIT, nil
-	}
-	return 0, fmt.Errorf("invalid order type: %s", s)
-}
-
-func validateQuantity(q int64) bool {
-	return q > 0
-}
-
-func validatePrice(t OrderType, p int64) bool {
-	if t == LIMIT && p <= 0 {
-		return false
-	}
-	return true
-}
-
-func NewOrder(symbol, orderType, orderSide, orderStatus string, qty, price int64) (*Order, error) {
-	status, err := parseStatus(orderStatus)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create order: %w", err)
-	}
-
-	side, err := parseSide(orderSide)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create order: %w", err)
-	}
-
-	otype, err := parseType(orderType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create order: %w", err)
-	}
-
-	if !validateQuantity(qty) {
-		err := errors.New("qunatity must be greater than 0")
-		return nil, fmt.Errorf("failed to create order: %w", err)
-	}
-
-	if !validatePrice(otype, price) {
-		err := errors.New("price must be greater than 0")
-		return nil, fmt.Errorf("failed to create order: %w", err)
-	}
-
-	return &Order{
-		OrderID:           uuid.New(),
-		Type:              otype,
-		Symbol:            symbol,
-		Side:              side,
-		Status:            status,
-		Quantity:          qty,
-		RemainingQuantity: qty,
-		Price:             price,
-		CreateAt:          time.Now(),
-		UpdatedAt:         time.Now(),
-	}, nil
-}
-
-// Market orders must have Quantity > 0, Price can be ignored
-// Limit orders must have both Quantity > 0 and Price > 0
-// RemainingQuantity must always be <= Quantity
-// Status transitions must follow valid state machine
-// CreatedAt is immutable after creation
-// Orders with RemainingQuantity = 0 should be marked FILLED
 
 func main() {
-	order, err := NewOrder("AAPL", "LIMIT", "BUY", "pending", 10, 0)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	fmt.Printf("%+v", order)
+    if err := run(); err != nil {
+        fmt.Printf("Error: %v\n", err)
+    }
+}
+
+func run() error {
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    
+    shutdown, err := setupTracing()
+    if err != nil {
+        return err
+    }
+    defer func() {
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        shutdown(shutdownCtx)
+    }()
+    
+    baseLogger := otelslog.NewLogger("app")
+    
+    r := chi.NewRouter()
+    r.Use(RequestLoggerMiddleware(baseLogger))
+    r.Get("/", homeHandler)
+    
+    srv := &http.Server{
+        Addr:    ":3000",
+        Handler: r,
+    }
+    
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            fmt.Printf("Server error: %v\n", err)
+        }
+    }()
+    
+    <-ctx.Done()
+    
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    return srv.Shutdown(shutdownCtx)
+}
+
+func setupTracing() (func(context.Context) error, error) {
+    // Trace exporter
+    traceExporter, err := stdouttrace.New()
+    if err != nil {
+        return nil, err
+    }
+
+    // Log exporter
+    logExporter, err := stdoutlog.New()
+    if err != nil {
+        return nil, err
+    }
+
+    // Trace provider
+    tracerProvider := trace.NewTracerProvider(
+        trace.WithBatcher(traceExporter),
+    )
+
+    // Log provider
+    loggerProvider := log.NewLoggerProvider(
+        log.WithProcessor(log.NewBatchProcessor(logExporter)),
+    )
+
+    otel.SetTracerProvider(tracerProvider)
+    global.SetLoggerProvider(loggerProvider)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+
+    // Combined shutdown
+    shutdown := func(ctx context.Context) error {
+        if err := tracerProvider.Shutdown(ctx); err != nil {
+            return err
+        }
+        return loggerProvider.Shutdown(ctx)
+    }
+
+    return shutdown, nil
+}
+
+func RequestLoggerMiddleware(baseLogger *slog.Logger) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            ctx := r.Context()
+            
+            tracer := otel.Tracer("app")
+            ctx, span := tracer.Start(ctx, r.URL.Path)
+            defer span.End()
+            
+            requestID := fmt.Sprintf("req-%d", time.Now().UnixNano())
+            traceID := span.SpanContext().TraceID().String()
+            spanID := span.SpanContext().SpanID().String()
+            
+            logger := baseLogger.With(
+                "request_id", requestID,
+                "trace_id", traceID,
+                "span_id", spanID,
+                "method", r.Method,
+                "path", r.URL.Path,
+            )
+            
+            ctx = context.WithValue(ctx, loggerKey, logger)
+            
+            logger.InfoContext(ctx, "request started")
+            next.ServeHTTP(w, r.WithContext(ctx))
+            logger.InfoContext(ctx, "request finished")
+        })
+    }
+}
+
+func GetLogger(ctx context.Context) *slog.Logger {
+    if logger, ok := ctx.Value(loggerKey).(*slog.Logger); ok {
+        return logger
+    }
+    return slog.Default()
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    logger := GetLogger(ctx)
+    logger.InfoContext(ctx, "processing home request")
+    w.Write([]byte("Hello World"))
 }
